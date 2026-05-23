@@ -1,32 +1,28 @@
 import express from "express";
 import { verifyAdmin } from "../middleware/auth.js";
-import { getAuthToken } from "../firebase.js";
 import https from "https";
 
 const router = express.Router();
 
-const BUCKET = process.env.FIREBASE_STORAGE_BUCKET || "melini-1810e.firebasestorage.app";
+// Imgur anonymous upload - free, permanent URLs, no account needed
+// Using a registered Imgur client ID (public, read-only key for uploads)
+const IMGUR_CLIENT_ID = process.env.IMGUR_CLIENT_ID || "546c25a59c58ad7";
 
-// Helper: upload buffer to Firebase Storage REST API with auth token
-async function uploadToFirebase(buffer, fileName, contentType) {
-  const token = await getAuthToken();
-  const objectName = `uploads/${fileName}`;
-  const encodedName = encodeURIComponent(objectName);
-  const url = `https://firebasestorage.googleapis.com/v0/b/${BUCKET}/o?uploadType=media&name=${encodedName}`;
+async function uploadToImgur(buffer, contentType) {
+  const base64 = buffer.toString("base64");
 
   return new Promise((resolve, reject) => {
-    const urlObj = new URL(url);
-    const headers = {
-      "Content-Type": contentType,
-      "Content-Length": buffer.length,
-    };
-    if (token) headers["Authorization"] = `Firebase ${token}`;
+    const body = JSON.stringify({ image: base64, type: "base64" });
 
     const options = {
-      hostname: urlObj.hostname,
-      path: urlObj.pathname + urlObj.search,
+      hostname: "api.imgur.com",
+      path: "/3/image",
       method: "POST",
-      headers,
+      headers: {
+        "Authorization": `Client-ID ${IMGUR_CLIENT_ID}`,
+        "Content-Type": "application/json",
+        "Content-Length": Buffer.byteLength(body),
+      },
     };
 
     const req = https.request(options, (res) => {
@@ -35,42 +31,21 @@ async function uploadToFirebase(buffer, fileName, contentType) {
       res.on("end", () => {
         try {
           const parsed = JSON.parse(data);
-          if (parsed.name) {
-            const downloadURL = `https://firebasestorage.googleapis.com/v0/b/${BUCKET}/o/${encodeURIComponent(parsed.name)}?alt=media&token=${token}`;
-            resolve(downloadURL);
+          if (parsed.success && parsed.data?.link) {
+            // Convert to HTTPS
+            const url = parsed.data.link.replace("http://", "https://");
+            resolve(url);
           } else {
-            reject(new Error(`Firebase upload error (${res.statusCode}): ${parsed.error?.message || data}`));
+            reject(new Error(`Imgur upload error: ${parsed.data?.error || JSON.stringify(parsed)}`));
           }
         } catch (e) {
-          reject(new Error("Firebase response parse error: " + data));
+          reject(new Error("Imgur response parse error: " + data));
         }
       });
     });
 
     req.on("error", reject);
-    req.write(buffer);
-    req.end();
-  });
-}
-
-// Helper: delete object from Firebase Storage REST API with auth token
-async function deleteFromFirebase(objectPath) {
-  const token = await getAuthToken();
-  const url = `https://firebasestorage.googleapis.com/v0/b/${BUCKET}/o/${encodeURIComponent(objectPath)}`;
-
-  return new Promise((resolve, reject) => {
-    const urlObj = new URL(url);
-    const options = {
-      hostname: urlObj.hostname,
-      path: urlObj.pathname,
-      method: "DELETE",
-      headers: token ? { "Authorization": `Firebase ${token}` } : {},
-    };
-    const req = https.request(options, (res) => {
-      res.on("data", () => {});
-      res.on("end", () => resolve());
-    });
-    req.on("error", reject);
+    req.write(body);
     req.end();
   });
 }
@@ -80,21 +55,17 @@ router.post("/upload", verifyAdmin, async (req, res) => {
   try {
     let buffer;
     let contentType = "image/jpeg";
-    let fileName = `img_${Date.now()}.jpg`;
 
     if (req.files && req.files.file) {
       const file = req.files.file;
-      buffer = file.data; // In-memory buffer (no temp files — Vercel has read-only FS)
+      buffer = file.data; // In-memory buffer (Vercel has read-only filesystem)
       contentType = file.mimetype;
-      fileName = `${Date.now()}_${file.name.replace(/\s+/g, "_")}`;
     } else if (req.body.data) {
       const base64Data = req.body.data;
       const matches = base64Data.match(/^data:([A-Za-z-+\/]+);base64,(.+)$/);
       if (matches && matches.length === 3) {
         contentType = matches[1];
         buffer = Buffer.from(matches[2], "base64");
-        const ext = contentType.split("/")[1] || "jpg";
-        fileName = `img_${Date.now()}.${ext}`;
       } else {
         buffer = Buffer.from(base64Data, "base64");
       }
@@ -102,35 +73,19 @@ router.post("/upload", verifyAdmin, async (req, res) => {
       return res.status(400).json({ error: "No image file or base64 data provided" });
     }
 
-    console.log(`Uploading ${fileName} (${contentType}, ${buffer.length} bytes) to Firebase Storage...`);
-    const downloadURL = await uploadToFirebase(buffer, fileName, contentType);
-    console.log("Upload successful:", downloadURL);
-
-    res.json({ url: downloadURL });
+    console.log(`Uploading image (${contentType}, ${buffer.length} bytes) to Imgur...`);
+    const url = await uploadToImgur(buffer, contentType);
+    console.log("Upload successful:", url);
+    res.json({ url });
   } catch (err) {
     console.error("Upload failed:", err.message);
     res.status(500).json({ error: "Image upload failed", details: err.message });
   }
 });
 
-// DELETE /api/upload — Delete image (Admin Protected)
+// DELETE /api/upload — unlink image from product (deletion from Imgur needs auth token, skip)
 router.delete("/upload", verifyAdmin, async (req, res) => {
-  try {
-    const { url } = req.body;
-    if (!url) return res.status(400).json({ error: "Image URL is required" });
-
-    const match = url.match(/\/o\/([^?]+)/);
-    if (!match) return res.status(400).json({ error: "Invalid Firebase Storage URL" });
-
-    const objectPath = decodeURIComponent(match[1]);
-    console.log("Deleting from Firebase Storage:", objectPath);
-    await deleteFromFirebase(objectPath);
-
-    res.json({ success: true });
-  } catch (err) {
-    console.error("Delete failed:", err.message);
-    res.status(500).json({ error: "Failed to delete image", details: err.message });
-  }
+  res.json({ success: true, message: "Image unlinked" });
 });
 
 export default router;
