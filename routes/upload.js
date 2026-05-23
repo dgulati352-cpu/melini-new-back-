@@ -1,7 +1,5 @@
 import express from "express";
 import { verifyAdmin } from "../middleware/auth.js";
-import fs from "fs";
-import path from "path";
 import https from "https";
 
 const router = express.Router();
@@ -59,7 +57,8 @@ router.post("/upload", verifyAdmin, async (req, res) => {
 
     if (req.files && req.files.file) {
       const file = req.files.file;
-      buffer = fs.readFileSync(file.tempFilePath);
+      // Use in-memory buffer — Vercel serverless has no writable filesystem
+      buffer = file.data;
       contentType = file.mimetype;
       fileName = `${Date.now()}_${file.name.replace(/\s+/g, "_")}`;
     } else if (req.body.data) {

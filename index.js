@@ -2,7 +2,6 @@ import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
 import fileUpload from "express-fileupload";
-import os from "os";
 
 // Import modular routes
 import authRouter from "./routes/auth.js";
@@ -31,10 +30,9 @@ app.use(cors({
 app.use(express.json({ limit: "50mb" }));
 app.use(express.urlencoded({ limit: "50mb", extended: true }));
 
-// Express File Upload configuration for Cloudinary uploads
+// Express File Upload configuration — keep in memory (no temp files on Vercel)
 app.use(fileUpload({
-  useTempFiles: true,
-  tempFileDir: os.tmpdir()
+  limits: { fileSize: 10 * 1024 * 1024 } // 10MB max
 }));
 
 // Mount modular routers onto the main /api router
