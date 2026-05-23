@@ -20,8 +20,19 @@ export const auth = getAuth(app);
 export const storage = getStorage(app);
 
 // Authenticate anonymously so the backend can read/write data securely
-signInAnonymously(auth).then(() => {
+let authReady = signInAnonymously(auth).then(() => {
   console.log("Authenticated anonymously with Firebase RTDB successfully 🔌");
 }).catch((error) => {
   console.error("Anonymous auth failed:", error);
 });
+
+// Returns a fresh Firebase ID token for the anonymous session (used for Storage REST API)
+export async function getAuthToken() {
+  await authReady;
+  const user = auth.currentUser;
+  if (!user) {
+    // Re-auth if session expired
+    await signInAnonymously(auth);
+  }
+  return auth.currentUser?.getIdToken(true);
+}
