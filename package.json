@@ -1,7 +1,7 @@
 {
-  "name": "melini-backend",
+  "name": "backend",
   "version": "1.0.0",
-  "description": "Standalone Firebase Client Backend for MELINI",
+  "description": "Integrated Firebase Client Backend for MELINI",
   "main": "index.js",
   "type": "module",
   "scripts": {
