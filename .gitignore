@@ -27,3 +27,4 @@ temp/
 Thumbs.db
 
 .vercel
+.env*
