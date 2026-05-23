@@ -1,110 +1,126 @@
 import express from "express";
-import cloudinary from "../config/cloudinary.js";
 import { verifyAdmin } from "../middleware/auth.js";
-import { storage } from "../firebase.js";
 import fs from "fs";
+import path from "path";
+import https from "https";
 
 const router = express.Router();
+
+const FIREBASE_STORAGE_BUCKET = process.env.FIREBASE_STORAGE_BUCKET || "melini-1810e.firebasestorage.app";
+const UPLOAD_URL = `https://firebasestorage.googleapis.com/v0/b/${FIREBASE_STORAGE_BUCKET}/o`;
+
+// Helper: upload buffer to Firebase Storage REST API (no auth required for public buckets)
+async function uploadToFirebase(buffer, fileName, contentType) {
+  const encodedName = encodeURIComponent(`uploads/${fileName}`);
+  const url = `${UPLOAD_URL}?uploadType=media&name=${encodedName}`;
+
+  return new Promise((resolve, reject) => {
+    const urlObj = new URL(url);
+    const options = {
+      hostname: urlObj.hostname,
+      path: urlObj.pathname + urlObj.search,
+      method: "POST",
+      headers: {
+        "Content-Type": contentType,
+        "Content-Length": buffer.length,
+      },
+    };
+
+    const req = https.request(options, (res) => {
+      let data = "";
+      res.on("data", (chunk) => (data += chunk));
+      res.on("end", () => {
+        try {
+          const parsed = JSON.parse(data);
+          if (parsed.name) {
+            const downloadURL = `https://firebasestorage.googleapis.com/v0/b/${FIREBASE_STORAGE_BUCKET}/o/${encodeURIComponent(parsed.name)}?alt=media`;
+            resolve(downloadURL);
+          } else {
+            reject(new Error(parsed.error?.message || "Firebase upload failed: " + data));
+          }
+        } catch (e) {
+          reject(new Error("Firebase response parse error: " + data));
+        }
+      });
+    });
+
+    req.on("error", reject);
+    req.write(buffer);
+    req.end();
+  });
+}
 
 // Secure image upload (Admin Protected)
 router.post("/upload", verifyAdmin, async (req, res) => {
   try {
-    let uploadPath;
-    let isFile = false;
+    let buffer;
+    let contentType = "image/jpeg";
+    let fileName = `img_${Date.now()}.jpg`;
 
     if (req.files && req.files.file) {
-      uploadPath = req.files.file.tempFilePath;
-      isFile = true;
+      const file = req.files.file;
+      buffer = fs.readFileSync(file.tempFilePath);
+      contentType = file.mimetype;
+      fileName = `${Date.now()}_${file.name.replace(/\s+/g, "_")}`;
     } else if (req.body.data) {
-      uploadPath = req.body.data; // Base64 data support
-    } else {
-      return res.status(400).json({ error: "No image file or base64 data uploaded" });
-    }
-
-    let downloadURL;
-
-    if (process.env.CLOUDINARY_CLOUD_NAME) {
-      console.log("Initiating Cloudinary upload stream...");
-      const result = await cloudinary.uploader.upload(uploadPath, {
-        folder: "melini",
-        resource_type: "auto"
-      });
-      console.log("Cloudinary upload successful, secure url generated:", result.secure_url);
-      downloadURL = result.secure_url;
-    } else {
-      console.log("Cloudinary configuration missing. Falling back to Firebase Storage upload...");
-      let buffer;
-      let contentType = "image/jpeg";
-      let fileName = `upload_${Date.now()}.jpg`;
-
-      if (isFile) {
-        buffer = fs.readFileSync(req.files.file.tempFilePath);
-        contentType = req.files.file.mimetype;
-        fileName = `${Date.now()}_${req.files.file.name}`;
+      const base64Data = req.body.data;
+      const matches = base64Data.match(/^data:([A-Za-z-+\/]+);base64,(.+)$/);
+      if (matches && matches.length === 3) {
+        contentType = matches[1];
+        buffer = Buffer.from(matches[2], "base64");
+        const ext = contentType.split("/")[1] || "jpg";
+        fileName = `img_${Date.now()}.${ext}`;
       } else {
-        const base64Data = req.body.data;
-        const matches = base64Data.match(/^data:([A-Za-z-+\/]+);base64,(.+)$/);
-        if (matches && matches.length === 3) {
-          contentType = matches[1];
-          buffer = Buffer.from(matches[2], "base64");
-        } else {
-          buffer = Buffer.from(base64Data, "base64");
-        }
+        buffer = Buffer.from(base64Data, "base64");
       }
-
-      const { ref: sRef, uploadBytes, getDownloadURL } = await import("firebase/storage");
-      const storageRef = sRef(storage, `uploads/${fileName}`);
-      const metadata = { contentType };
-      const snapshot = await uploadBytes(storageRef, buffer, metadata);
-      downloadURL = await getDownloadURL(snapshot.ref);
-      console.log("Firebase Storage upload successful, URL generated:", downloadURL);
+    } else {
+      return res.status(400).json({ error: "No image file or base64 data provided" });
     }
+
+    console.log(`Uploading ${fileName} (${contentType}) to Firebase Storage...`);
+    const downloadURL = await uploadToFirebase(buffer, fileName, contentType);
+    console.log("Upload successful:", downloadURL);
 
     res.json({ url: downloadURL });
   } catch (err) {
-    console.error("Upload stream exception:", err);
-    res.status(500).json({ error: "Image storage upload failed", details: err.message });
+    console.error("Upload failed:", err.message);
+    res.status(500).json({ error: "Image upload failed", details: err.message });
   }
 });
 
-// Delete image (Admin Protected)
+// Delete image from Firebase Storage (Admin Protected)
 router.delete("/upload", verifyAdmin, async (req, res) => {
   try {
     const { url } = req.body;
-    if (!url) return res.status(400).json({ error: "URL of image to delete is required" });
+    if (!url) return res.status(400).json({ error: "Image URL is required" });
 
-    if (url.includes("firebasestorage.googleapis.com")) {
-      console.log("Initiating Firebase Storage asset deletion...");
-      const { ref: sRef, deleteObject } = await import("firebase/storage");
-      const decodedUrl = decodeURIComponent(url);
-      const parts = decodedUrl.split("/o/");
-      if (parts.length > 1) {
-        const fullPath = parts[1].split("?")[0];
-        const storageRef = sRef(storage, fullPath);
-        await deleteObject(storageRef);
-        console.log("Firebase Storage asset deleted successfully:", fullPath);
-        return res.json({ success: true, message: "Firebase storage asset deleted successfully" });
-      } else {
-        return res.status(400).json({ error: "Invalid Firebase Storage URL format" });
-      }
-    }
+    // Extract the object path from the URL
+    const match = url.match(/\/o\/([^?]+)/);
+    if (!match) return res.status(400).json({ error: "Invalid Firebase Storage URL" });
 
-    if (!process.env.CLOUDINARY_CLOUD_NAME) {
-      return res.status(400).json({ error: "Cloudinary credentials missing; cannot delete Cloudinary asset" });
-    }
+    const objectPath = decodeURIComponent(match[1]);
+    const deleteUrl = `${UPLOAD_URL}/${encodeURIComponent(objectPath)}`;
 
-    // Extract public_id from Cloudinary asset URL
-    const parts = url.split("/");
-    const filename = parts[parts.length - 1].split(".")[0];
-    const folder = parts[parts.length - 2];
-    const publicId = `${folder}/${filename}`;
+    const urlObj = new URL(deleteUrl);
+    await new Promise((resolve, reject) => {
+      const options = {
+        hostname: urlObj.hostname,
+        path: urlObj.pathname + urlObj.search,
+        method: "DELETE",
+      };
+      const req = https.request(options, (res) => {
+        res.on("data", () => {});
+        res.on("end", () => resolve());
+      });
+      req.on("error", reject);
+      req.end();
+    });
 
-    console.log("Initiating Cloudinary asset deletion for:", publicId);
-    const result = await cloudinary.uploader.destroy(publicId);
-    res.json({ success: true, result });
+    console.log("Deleted from Firebase Storage:", objectPath);
+    res.json({ success: true });
   } catch (err) {
-    console.error("Delete asset exception:", err);
-    res.status(500).json({ error: "Failed to delete image storage asset", details: err.message });
+    console.error("Delete failed:", err.message);
+    res.status(500).json({ error: "Failed to delete image", details: err.message });
   }
 });
 
