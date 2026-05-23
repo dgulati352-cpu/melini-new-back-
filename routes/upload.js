@@ -1,56 +1,35 @@
 import express from "express";
 import { verifyAdmin } from "../middleware/auth.js";
-import https from "https";
+import { db } from "../firebase.js";
+import { ref, set, get, remove } from "firebase/database";
 
 const router = express.Router();
 
-// Imgur anonymous upload - free, permanent URLs, no account needed
-// Using a registered Imgur client ID (public, read-only key for uploads)
-const IMGUR_CLIENT_ID = process.env.IMGUR_CLIENT_ID || "546c25a59c58ad7";
+// GET /api/images/:id — Serve image from Firebase Realtime Database (Public)
+router.get("/images/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const imageRef = ref(db, `images/${id}`);
+    const snapshot = await get(imageRef);
 
-async function uploadToImgur(buffer, contentType) {
-  const base64 = buffer.toString("base64");
+    if (!snapshot.exists()) {
+      return res.status(404).json({ error: "Image not found" });
+    }
 
-  return new Promise((resolve, reject) => {
-    const body = JSON.stringify({ image: base64, type: "base64" });
+    const { mime, data } = snapshot.val();
+    const buffer = Buffer.from(data, "base64");
 
-    const options = {
-      hostname: "api.imgur.com",
-      path: "/3/image",
-      method: "POST",
-      headers: {
-        "Authorization": `Client-ID ${IMGUR_CLIENT_ID}`,
-        "Content-Type": "application/json",
-        "Content-Length": Buffer.byteLength(body),
-      },
-    };
+    // Cache image in browser for 1 year to ensure high performance
+    res.setHeader("Content-Type", mime || "image/jpeg");
+    res.setHeader("Cache-Control", "public, max-age=31536000, immutable");
+    res.send(buffer);
+  } catch (err) {
+    console.error("Serve image failed:", err.message);
+    res.status(500).json({ error: "Failed to retrieve image" });
+  }
+});
 
-    const req = https.request(options, (res) => {
-      let data = "";
-      res.on("data", (chunk) => (data += chunk));
-      res.on("end", () => {
-        try {
-          const parsed = JSON.parse(data);
-          if (parsed.success && parsed.data?.link) {
-            // Convert to HTTPS
-            const url = parsed.data.link.replace("http://", "https://");
-            resolve(url);
-          } else {
-            reject(new Error(`Imgur upload error: ${parsed.data?.error || JSON.stringify(parsed)}`));
-          }
-        } catch (e) {
-          reject(new Error("Imgur response parse error: " + data));
-        }
-      });
-    });
-
-    req.on("error", reject);
-    req.write(body);
-    req.end();
-  });
-}
-
-// POST /api/upload — Secure image upload (Admin Protected)
+// POST /api/upload — Upload image (Admin Protected)
 router.post("/upload", verifyAdmin, async (req, res) => {
   try {
     let buffer;
@@ -58,7 +37,7 @@ router.post("/upload", verifyAdmin, async (req, res) => {
 
     if (req.files && req.files.file) {
       const file = req.files.file;
-      buffer = file.data; // In-memory buffer (Vercel has read-only filesystem)
+      buffer = file.data;
       contentType = file.mimetype;
     } else if (req.body.data) {
       const base64Data = req.body.data;
@@ -73,19 +52,54 @@ router.post("/upload", verifyAdmin, async (req, res) => {
       return res.status(400).json({ error: "No image file or base64 data provided" });
     }
 
-    console.log(`Uploading image (${contentType}, ${buffer.length} bytes) to Imgur...`);
-    const url = await uploadToImgur(buffer, contentType);
-    console.log("Upload successful:", url);
-    res.json({ url });
+    // Generate unique image ID
+    const imgId = `img_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`;
+    const base64Str = buffer.toString("base64");
+
+    console.log(`Saving image ${imgId} (${contentType}, ${buffer.length} bytes) to Firebase RTDB...`);
+    
+    // Save image to RTDB
+    const imageRef = ref(db, `images/${imgId}`);
+    await set(imageRef, {
+      mime: contentType,
+      data: base64Str,
+      uploadedAt: Date.now()
+    });
+
+    // Construct public image serving URL
+    const host = req.get("host");
+    const protocol = req.protocol;
+    const downloadURL = `${protocol}://${host}/api/images/${imgId}`;
+    
+    console.log("Upload successful. Served via URL:", downloadURL);
+    res.json({ url: downloadURL });
   } catch (err) {
     console.error("Upload failed:", err.message);
     res.status(500).json({ error: "Image upload failed", details: err.message });
   }
 });
 
-// DELETE /api/upload — unlink image from product (deletion from Imgur needs auth token, skip)
+// DELETE /api/upload — Delete image from Database (Admin Protected)
 router.delete("/upload", verifyAdmin, async (req, res) => {
-  res.json({ success: true, message: "Image unlinked" });
+  try {
+    const { url } = req.body;
+    if (!url) return res.status(400).json({ error: "Image URL is required" });
+
+    // Extract image ID from URL
+    const match = url.match(/\/api\/images\/([^/?]+)/);
+    if (!match) return res.status(400).json({ error: "Invalid image URL" });
+
+    const imgId = match[1];
+    console.log("Deleting image from Firebase RTDB:", imgId);
+    
+    const imageRef = ref(db, `images/${imgId}`);
+    await remove(imageRef);
+
+    res.json({ success: true, message: "Image deleted successfully" });
+  } catch (err) {
+    console.error("Delete failed:", err.message);
+    res.status(500).json({ error: "Failed to delete image", details: err.message });
+  }
 });
 
 export default router;
